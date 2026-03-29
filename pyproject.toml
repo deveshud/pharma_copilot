@@ -1,7 +1,14 @@
 [project]
 name = "pharma-copilot"
 version = "0.1.0"
-description = "Add your description here"
+description = "A python based RAG project to learn document ingestion, chunking, embeddings, retrieval, and grounded answer generation"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "streamlit",
+    "pandas",
+    "python-dotenv",
+    "pypdf",
+    "python-docx",
+    "pytest",
+]
