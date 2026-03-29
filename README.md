@@ -71,7 +71,7 @@ Example questions:
 - What are the key assumptions in this proposal?
 - Which section explains the KPI logic?
 - What dependencies are mentioned for access or environments?
-- Which document discusses Labs scope?
+- Which document discusses scope?
 - What are the out-of-scope items?
 
 ---
