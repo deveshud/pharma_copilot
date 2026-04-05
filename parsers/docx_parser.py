@@ -15,17 +15,15 @@ class DocumentBlock:
     source_file: str
     source_path: str
     doc_type: str
-    block_type: str                  # heading | paragraph | table
+    block_type: str
     order: int
     text: str
     section_path: List[str] = field(default_factory=list)
-
-    style_name: Optional[str] = None
-    heading_score: Optional[int] = None
-    paragraph_index: Optional[int] = None
-    table_row_count: Optional[int] = None
-    table_col_count: Optional[int] = None
-
+    page_number: Optional[int] = None
+    slide_number: Optional[int] = None
+    shape_index: Optional[int] = None
+    sheet_name: Optional[str] = None
+    row_number: Optional[int] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -34,7 +32,7 @@ class DocxParser:
         self.heading_threshold = heading_threshold
 
     def _make_block_id(self) -> str:
-        return f"block_{uuid.uuid4().hex[:12]}"
+        return f"docx_{uuid.uuid4().hex[:12]}"
 
     def _clean_text(self, text: str) -> str:
         return text.strip() if text else ""
@@ -180,12 +178,12 @@ class DocxParser:
                     order=order_counter,
                     text=text,
                     section_path=[current_section] if current_section else [],
-                    style_name=style_name,
-                    heading_score=score,
-                    paragraph_index=paragraph_counter,
                     metadata={
                         "is_heading_like": is_heading_like,
-                        "heading_reasons": reasons
+                        "heading_reasons": reasons,
+                        "style_name": style_name,
+                        "heading_score": score,
+                        "paragraph_index": paragraph_counter,
                     }
                 )
                 blocks.append(block)
@@ -206,9 +204,10 @@ class DocxParser:
                     order=order_counter,
                     text=table_text,
                     section_path=[current_section] if current_section else [],
-                    table_row_count=row_count,
-                    table_col_count=col_count,
-                    metadata={}
+                    metadata={
+                        "table_row_count": row_count,
+                        "table_col_count": col_count,
+                    }
                 )
                 blocks.append(block)
 
