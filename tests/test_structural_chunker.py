@@ -10,6 +10,14 @@ if str(PROJECT_ROOT) not in sys.path:
 from chunkers.structural_chunker import StructuralChunker, chunk_consolidated_blocks
 
 
+class FakeTokenizer:
+    def encode(self, text: str, add_special_tokens: bool = True, truncation: bool = False) -> list[str]:
+        tokens = text.split()
+        if add_special_tokens:
+            return ["[CLS]", *tokens, "[SEP]"]
+        return tokens
+
+
 def make_block(
     *,
     block_id: str,
@@ -52,7 +60,7 @@ def test_structural_chunker_groups_body_by_section_and_keeps_tables_separate() -
         make_block(block_id="p3", order=6, text="Detailed section body.", section_path=["Details"]),
     ]
 
-    chunks = StructuralChunker(max_chars=120).chunk_file_blocks(blocks)
+    chunks = StructuralChunker(max_chars=120, tokenizer=FakeTokenizer()).chunk_file_blocks(blocks)
 
     assert [chunk["chunk_type"] for chunk in chunks] == ["section", "table", "section", "section"]
     assert chunks[0]["section_path"] == ["Overview"]
@@ -77,7 +85,7 @@ def test_structural_chunker_splits_large_sections_without_losing_traceability() 
         make_block(block_id="p1", order=2, text=long_text, section_path=["Safety Review"]),
     ]
 
-    chunks = StructuralChunker(max_chars=100).chunk_file_blocks(blocks)
+    chunks = StructuralChunker(max_chars=100, tokenizer=FakeTokenizer()).chunk_file_blocks(blocks)
 
     assert len(chunks) >= 2
     assert all(chunk["chunk_type"] == "section" for chunk in chunks)
@@ -115,7 +123,7 @@ def test_chunk_file_blocks_rejects_mixed_source_files() -> None:
     ]
 
     with pytest.raises(ValueError):
-        StructuralChunker().chunk_file_blocks(blocks)
+        StructuralChunker(tokenizer=FakeTokenizer()).chunk_file_blocks(blocks)
 
 
 def test_structural_chunker_does_not_duplicate_heading_after_table_boundary() -> None:
@@ -127,7 +135,36 @@ def test_structural_chunker_does_not_duplicate_heading_after_table_boundary() ->
         make_block(block_id="p2", order=5, text="Next body.", section_path=["Next Section"]),
     ]
 
-    chunks = StructuralChunker(max_chars=120).chunk_file_blocks(blocks)
+    chunks = StructuralChunker(max_chars=120, tokenizer=FakeTokenizer()).chunk_file_blocks(blocks)
 
     assert [chunk["heading"] for chunk in chunks] == ["Overview", "Overview", "Next Section"]
     assert [chunk["chunk_type"] for chunk in chunks] == ["section", "table", "section"]
+
+
+def test_structural_chunker_preserves_overlap_when_splitting_long_sections() -> None:
+    blocks = [
+        make_block(block_id="h1", order=1, text="Clinical Notes", block_type="heading", section_path=["Clinical Notes"]),
+        make_block(
+            block_id="p1",
+            order=2,
+            text=(
+                "Sentence one introduces the patient context. "
+                "Sentence two records the baseline symptom history. "
+                "Sentence three explains the response to treatment. "
+                "Sentence four captures the next-step monitoring plan."
+            ),
+            section_path=["Clinical Notes"],
+        ),
+    ]
+
+    chunks = StructuralChunker(
+        max_chars=500,
+        max_tokens=24,
+        overlap_tokens=10,
+        tokenizer=FakeTokenizer(),
+    ).chunk_file_blocks(blocks)
+
+    assert len(chunks) >= 2
+    assert "Sentence three explains the response to treatment." in chunks[0]["text"]
+    assert "Sentence three explains the response to treatment." in chunks[1]["text"]
+    assert all(chunk["heading"] == "Clinical Notes" for chunk in chunks)

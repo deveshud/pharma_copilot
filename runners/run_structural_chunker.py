@@ -11,9 +11,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from chunkers.structural_chunker import StructuralChunker
 
 
-PARSED_OUTPUTS_DIR = PROJECT_ROOT / "parsed_outputs"
-DEFAULT_INPUT_PATH = PARSED_OUTPUTS_DIR / "normalized_ingestion_blocks.json"
-DEFAULT_OUTPUT_PATH = PARSED_OUTPUTS_DIR / "structural_chunks.json"
+OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+DEFAULT_INPUT_PATH = OUTPUTS_DIR / "normalized_ingestion_blocks.json"
+DEFAULT_OUTPUT_PATH = OUTPUTS_DIR / "structural_chunks.json"
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -36,6 +36,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=2000,
         help="Maximum character budget per non-table chunk.",
     )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=380,
+        help="Maximum token budget per non-table chunk, leaving room for retrieval metadata.",
+    )
+    parser.add_argument(
+        "--overlap-tokens",
+        type=int,
+        default=40,
+        help="Token overlap carried from one chunk to the next within the same section.",
+    )
     return parser
 
 
@@ -54,7 +66,11 @@ def main() -> int:
     if not input_path.exists():
         raise FileNotFoundError(f"Input JSON not found: {input_path.resolve()}")
 
-    chunker = StructuralChunker(max_chars=args.max_chars)
+    chunker = StructuralChunker(
+        max_chars=args.max_chars,
+        max_tokens=args.max_tokens,
+        overlap_tokens=args.overlap_tokens,
+    )
     consolidated_blocks = chunker.load_consolidated_blocks(input_path)
     chunked_output = chunker.chunk_consolidated_blocks(consolidated_blocks)
     saved_path = chunker.save_chunked_output(chunked_output, output_path)
