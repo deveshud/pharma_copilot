@@ -16,4 +16,6 @@ dependencies = [
     "openpyxl>=3.1.5",
     "sentence-transformers>=5.3.0",
     "chromadb>=1.5.7",
+    "ollama>=0.6.1",
+    "torchvision>=0.26.0",
 ]

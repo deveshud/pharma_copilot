@@ -18,6 +18,7 @@ class FakeEncoder:
 class FakeChromaCollection:
     def __init__(self) -> None:
         self.last_query: dict[str, object] | None = None
+        self.last_get: dict[str, object] | None = None
 
     def query(self, **kwargs: object) -> dict[str, object]:
         self.last_query = kwargs
@@ -59,7 +60,60 @@ class FakeChromaCollection:
             "distances": [[0.01, 0.08]],
         }
 
-    def get(self, limit: int, include: list[str]) -> dict[str, object]:
+    def get(
+        self,
+        limit: int | None = None,
+        include: list[str] | None = None,
+        where: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        self.last_get = {"limit": limit, "include": include or [], "where": where or {}}
+        if where:
+            return {
+                "ids": ["chunk_scope", "chunk_scope_detail", "chunk_other"],
+                "documents": [
+                    (
+                        "Source File: proposal.docx\nSection Title: Project Scope\nContent:\n"
+                        "Project Scope: Requirements gathering and mapping are included."
+                    ),
+                    (
+                        "Source File: proposal.docx\nSection Title: Project Scope\nContent:\n"
+                        "Project Scope: Validation and signoff are also included in the same workstream."
+                    ),
+                    (
+                        "Source File: proposal.docx\nSection Title: Timeline\nContent:\n"
+                        "Timeline: The rollout follows project milestones."
+                    ),
+                ],
+                "metadatas": [
+                    {
+                        "chunk_id": "chunk_scope",
+                        "file_name": "proposal.docx",
+                        "source_file": "proposal.docx",
+                        "section_title": "Project Scope",
+                        "heading": "Project Scope:",
+                        "order_start": 10,
+                        "embedding_model": "fake-model",
+                    },
+                    {
+                        "chunk_id": "chunk_scope_detail",
+                        "file_name": "proposal.docx",
+                        "source_file": "proposal.docx",
+                        "section_title": "Project Scope",
+                        "heading": "Project Scope:",
+                        "order_start": 11,
+                        "embedding_model": "fake-model",
+                    },
+                    {
+                        "chunk_id": "chunk_other",
+                        "file_name": "proposal.docx",
+                        "source_file": "proposal.docx",
+                        "section_title": "Timeline",
+                        "heading": "Timeline",
+                        "order_start": 30,
+                        "embedding_model": "fake-model",
+                    },
+                ],
+            }
         return {"metadatas": [{"embedding_model": "fake-model"}]}
 
 
@@ -326,6 +380,27 @@ def test_retriever_queries_chroma_and_reranks_candidates() -> None:
     assert results[0]["raw_vector_score"] < 1.0
     assert results[0]["metadata"]["embedding_model"] == "fake-model"
     assert any(reason.startswith("boost:scope_section") for reason in results[0]["reasons"])
+
+
+def test_retriever_expands_chroma_results_with_associated_section_context() -> None:
+    collection = FakeChromaCollection()
+    retriever = LocalRetriever(encoder=FakeEncoder())  # type: ignore[arg-type]
+
+    results = retriever.retrieve_associated_debug_from_chroma(
+        "PSS A&R KPI Enablement Scope",
+        collection,
+        model_name="fake-model",
+        seed_k=1,
+        candidate_k=2,
+    )
+
+    chunk_ids = [result["chunk_id"] for result in results]
+    assert "chunk_scope" in chunk_ids
+    assert "chunk_scope_detail" in chunk_ids
+    assert "chunk_other" not in chunk_ids
+    assert collection.last_get is not None
+    assert collection.last_get["where"] == {"source_file": "proposal.docx"}
+    assert any(result["relationship"] == "same_section" for result in results)
 
 
 def test_retriever_infers_chroma_model_name_from_metadata() -> None:

@@ -1,6 +1,6 @@
-# Milestones
+# Feature Implementation Roadmap
 
-Milestones have been consolidated into the canonical roadmap:
+Feature implementation tracking has been consolidated into the canonical roadmap:
 
 - [roadmap.md](roadmap.md)
 

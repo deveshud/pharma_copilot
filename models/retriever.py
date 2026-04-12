@@ -168,6 +168,67 @@ class LocalRetriever:
         ranked_results = self._rerank_records(query=query, scored_records=records, top_k=top_k)
         return [self._format_debug_result(result) for result in ranked_results]
 
+    def retrieve_associated_debug_from_chroma(
+        self,
+        query: str,
+        collection: Any,
+        *,
+        model_name: str,
+        seed_k: int = 8,
+        candidate_k: int = 80,
+        associated_window: int = 2,
+        max_context_chunks: int = 24,
+    ) -> list[dict[str, Any]]:
+        if seed_k <= 0:
+            raise ValueError("seed_k must be a positive integer.")
+        if candidate_k < seed_k:
+            raise ValueError("candidate_k must be greater than or equal to seed_k.")
+        if associated_window < 0:
+            raise ValueError("associated_window cannot be negative.")
+        if max_context_chunks <= 0:
+            raise ValueError("max_context_chunks must be a positive integer.")
+
+        seed_results = self.retrieve_debug_from_chroma(
+            query,
+            collection,
+            model_name=model_name,
+            top_k=seed_k,
+            candidate_k=candidate_k,
+        )
+
+        ordered: dict[str, dict[str, Any]] = {}
+        group_order: dict[tuple[str, str], int] = {}
+        for group_index, seed in enumerate(seed_results):
+            source_file = self._result_source_file(seed)
+            section_title = self._result_section_title(seed)
+            group_key = (source_file, section_title)
+            group_order.setdefault(group_key, group_index)
+
+            seed = dict(seed)
+            seed["relationship"] = "semantic_seed"
+            seed["group_rank"] = group_order[group_key]
+            self._add_unique_result(ordered, seed)
+
+            for associated in self._associated_results_for_seed(
+                collection=collection,
+                seed=seed,
+                associated_window=associated_window,
+                group_rank=group_order[group_key],
+            ):
+                self._add_unique_result(ordered, associated)
+
+        results = list(ordered.values())
+        results.sort(
+            key=lambda item: (
+                int(item.get("group_rank", max_context_chunks)),
+                str(item.get("file_name") or ""),
+                self._sort_order(item.get("metadata", {}).get("order_start")),
+                0 if item.get("relationship") == "semantic_seed" else 1,
+                str(item.get("chunk_id") or ""),
+            )
+        )
+        return results[:max_context_chunks]
+
     def _rank_records(
         self,
         query: str,
@@ -234,6 +295,116 @@ class LocalRetriever:
             records.append(record)
 
         return records
+
+    def _associated_results_for_seed(
+        self,
+        *,
+        collection: Any,
+        seed: dict[str, Any],
+        associated_window: int,
+        group_rank: int,
+    ) -> list[dict[str, Any]]:
+        metadata = dict(seed.get("metadata") or {})
+        source_file = self._result_source_file(seed)
+        section_title = self._result_section_title(seed)
+        seed_order = self._safe_int(metadata.get("order_start"))
+        if not source_file:
+            return []
+
+        try:
+            chroma_result = collection.get(
+                where={"source_file": source_file},
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            return []
+
+        records = self._records_from_chroma_result(chroma_result)
+        associated: list[dict[str, Any]] = []
+        for record in records:
+            record_section = self._record_section_title(record)
+            record_metadata = dict(record.get("metadata") or {}).get("chroma_metadata", {})
+            record_order = self._safe_int(record_metadata.get("order_start"))
+
+            same_section = bool(section_title and record_section.lower() == section_title.lower())
+            near_seed = (
+                seed_order is not None
+                and record_order is not None
+                and abs(record_order - seed_order) <= associated_window
+            )
+            if not same_section and not near_seed:
+                continue
+
+            result = self._format_associated_result(
+                record=record,
+                relationship="same_section" if same_section else "nearby_context",
+                group_rank=group_rank,
+            )
+            associated.append(result)
+
+        return associated
+
+    @classmethod
+    def _format_associated_result(
+        cls,
+        *,
+        record: dict[str, Any],
+        relationship: str,
+        group_rank: int,
+    ) -> dict[str, Any]:
+        section_title = cls._record_section_title(record)
+        text = normalize_retrieved_text(str(record.get("text") or ""), section_title)
+        metadata = dict(record.get("metadata") or {})
+        chroma_metadata = metadata.get("chroma_metadata", {})
+        return {
+            "score": round(float(record.get("_raw_vector_score", 0.0)), 6),
+            "final_score": round(float(record.get("_raw_vector_score", 0.0)), 6),
+            "raw_vector_score": round(float(record.get("_raw_vector_score", 0.0)), 6),
+            "rerank_delta": 0.0,
+            "reasons": [f"associated:{relationship}"],
+            "relationship": relationship,
+            "group_rank": group_rank,
+            "chroma_distance": record.get("_chroma_distance"),
+            "chunk_id": record.get("chunk_id"),
+            "file_name": record.get("file_name") or record.get("source_file"),
+            "section_title": section_title,
+            "page_number": record.get("page_number"),
+            "chunk_length": len(text),
+            "preview": cls._preview(text),
+            "metadata": chroma_metadata,
+            "text": text,
+        }
+
+    @staticmethod
+    def _add_unique_result(results: dict[str, dict[str, Any]], result: dict[str, Any]) -> None:
+        chunk_id = str(result.get("chunk_id") or "").strip()
+        if not chunk_id:
+            chunk_id = f"{result.get('file_name')}::{result.get('section_title')}::{len(results)}"
+        if chunk_id not in results:
+            results[chunk_id] = result
+        elif result.get("relationship") == "semantic_seed":
+            results[chunk_id] = result
+
+    @staticmethod
+    def _result_source_file(result: dict[str, Any]) -> str:
+        metadata = dict(result.get("metadata") or {})
+        return str(metadata.get("source_file") or result.get("file_name") or "").strip()
+
+    @staticmethod
+    def _result_section_title(result: dict[str, Any]) -> str:
+        return normalize_narrative_text(str(result.get("section_title") or "")).rstrip(":")
+
+    @staticmethod
+    def _safe_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _sort_order(cls, value: Any) -> int:
+        order = cls._safe_int(value)
+        return order if order is not None else 1_000_000_000
 
     @staticmethod
     def _first_query_result(value: Any) -> list[Any]:
