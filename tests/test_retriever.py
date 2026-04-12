@@ -15,6 +15,54 @@ class FakeEncoder:
         return [0.0, 1.0, 0.0]
 
 
+class FakeChromaCollection:
+    def __init__(self) -> None:
+        self.last_query: dict[str, object] | None = None
+
+    def query(self, **kwargs: object) -> dict[str, object]:
+        self.last_query = kwargs
+        return {
+            "ids": [["chunk_admin", "chunk_scope"]],
+            "documents": [
+                [
+                    "Source File: proposal.docx\nContent:\nINDIVIDUAL PROJECT AGREEMENT under Master Services Agreement.",
+                    (
+                        "Source File: proposal.docx\nSection Title: Project Scope\nContent:\n"
+                        "Project Scope: Requirements gathering and mapping are included."
+                    ),
+                ]
+            ],
+            "metadatas": [
+                [
+                    {
+                        "chunk_id": "chunk_admin",
+                        "file_name": "proposal.docx",
+                        "source_file": "proposal.docx",
+                        "section_title": "INDIVIDUAL PROJECT AGREEMENT",
+                        "heading": "INDIVIDUAL PROJECT AGREEMENT",
+                        "block_ids": '["a1"]',
+                        "block_types": '["heading"]',
+                        "embedding_model": "fake-model",
+                    },
+                    {
+                        "chunk_id": "chunk_scope",
+                        "file_name": "proposal.docx",
+                        "source_file": "proposal.docx",
+                        "section_title": "Project Scope",
+                        "heading": "Project Scope:",
+                        "block_ids": '["s1", "s2"]',
+                        "block_types": '["heading", "paragraph"]',
+                        "embedding_model": "fake-model",
+                    },
+                ]
+            ],
+            "distances": [[0.01, 0.08]],
+        }
+
+    def get(self, limit: int, include: list[str]) -> dict[str, object]:
+        return {"metadatas": [{"embedding_model": "fake-model"}]}
+
+
 def make_payload() -> dict[str, object]:
     return {
         "model": {
@@ -257,3 +305,30 @@ def test_retriever_keeps_boilerplate_available_for_admin_queries() -> None:
 
     assert results[0]["chunk_id"] == "chunk_admin"
     assert not any(reason.startswith("penalty:boilerplate") for reason in results[0]["reasons"])
+
+
+def test_retriever_queries_chroma_and_reranks_candidates() -> None:
+    collection = FakeChromaCollection()
+    retriever = LocalRetriever(encoder=FakeEncoder())  # type: ignore[arg-type]
+
+    results = retriever.retrieve_debug_from_chroma(
+        "PSS A&R KPI Enablement Scope",
+        collection,
+        model_name="fake-model",
+        top_k=1,
+        candidate_k=2,
+    )
+
+    assert collection.last_query is not None
+    assert collection.last_query["n_results"] == 2
+    assert collection.last_query["query_embeddings"] == [[1.0, 0.0, 0.0]]
+    assert results[0]["chunk_id"] == "chunk_scope"
+    assert results[0]["raw_vector_score"] < 1.0
+    assert results[0]["metadata"]["embedding_model"] == "fake-model"
+    assert any(reason.startswith("boost:scope_section") for reason in results[0]["reasons"])
+
+
+def test_retriever_infers_chroma_model_name_from_metadata() -> None:
+    collection = FakeChromaCollection()
+
+    assert LocalRetriever.infer_chroma_model_name(collection, "fallback-model") == "fake-model"

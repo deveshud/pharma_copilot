@@ -5,10 +5,11 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Mapping
 
 from sentence_transformers import SentenceTransformer
 
+from models.chroma_store import DEFAULT_CHROMA_COLLECTION
 from models.retrieval_encoder import RetrievalEncoder
 from utils.text_normalization import normalize_narrative_text, normalize_retrieved_text
 
@@ -123,6 +124,50 @@ class LocalRetriever:
         embeddings_payload = self.load_embeddings_output(input_path)
         return self.retrieve_debug(query, embeddings_payload, top_k=top_k)
 
+    def retrieve_from_chroma(
+        self,
+        query: str,
+        collection: Any,
+        *,
+        model_name: str,
+        top_k: int = 5,
+        candidate_k: int = 25,
+    ) -> list[str]:
+        return [
+            result["text"]
+            for result in self.retrieve_debug_from_chroma(
+                query,
+                collection,
+                model_name=model_name,
+                top_k=top_k,
+                candidate_k=candidate_k,
+            )
+        ]
+
+    def retrieve_debug_from_chroma(
+        self,
+        query: str,
+        collection: Any,
+        *,
+        model_name: str,
+        top_k: int = 5,
+        candidate_k: int = 25,
+    ) -> list[dict[str, Any]]:
+        if top_k <= 0:
+            raise ValueError("top_k must be a positive integer.")
+        if candidate_k < top_k:
+            raise ValueError("candidate_k must be greater than or equal to top_k.")
+
+        query_embedding = self._get_encoder({"model": {"name": model_name}}).encode_query_text(query)
+        chroma_result = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=candidate_k,
+            include=["documents", "metadatas", "distances"],
+        )
+        records = self._records_from_chroma_result(chroma_result)
+        ranked_results = self._rerank_records(query=query, scored_records=records, top_k=top_k)
+        return [self._format_debug_result(result) for result in ranked_results]
+
     def _rank_records(
         self,
         query: str,
@@ -150,22 +195,162 @@ class LocalRetriever:
         scored_results.sort(key=lambda item: item["final_score"], reverse=True)
         return scored_results[:top_k]
 
+    def _rerank_records(
+        self,
+        *,
+        query: str,
+        scored_records: list[dict[str, Any]],
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        reranked_results = [
+            self._rerank_record(
+                query=query,
+                record=record,
+                raw_vector_score=float(record.get("_raw_vector_score", 0.0)),
+                records=scored_records,
+                index=index,
+            )
+            for index, record in enumerate(scored_records)
+        ]
+        reranked_results.sort(key=lambda item: item["final_score"], reverse=True)
+        return reranked_results[:top_k]
+
+    @classmethod
+    def _records_from_chroma_result(cls, chroma_result: Mapping[str, Any]) -> list[dict[str, Any]]:
+        ids = cls._first_query_result(chroma_result.get("ids"))
+        documents = cls._first_query_result(chroma_result.get("documents"))
+        metadatas = cls._first_query_result(chroma_result.get("metadatas"))
+        distances = cls._first_query_result(chroma_result.get("distances"))
+
+        records: list[dict[str, Any]] = []
+        for index, chunk_id in enumerate(ids):
+            metadata = dict(metadatas[index] or {}) if index < len(metadatas) else {}
+            document = str(documents[index] or "") if index < len(documents) else ""
+            distance = float(distances[index]) if index < len(distances) and distances[index] is not None else 1.0
+
+            record = cls._record_from_chroma_metadata(metadata, document=document, chunk_id=str(chunk_id))
+            record["_raw_vector_score"] = cls._score_from_chroma_distance(distance)
+            record["_chroma_distance"] = distance
+            records.append(record)
+
+        return records
+
+    @staticmethod
+    def _first_query_result(value: Any) -> list[Any]:
+        if not value:
+            return []
+        if isinstance(value, list) and value and isinstance(value[0], list):
+            return value[0]
+        if isinstance(value, list):
+            return value
+        return []
+
+    @classmethod
+    def _record_from_chroma_metadata(cls, metadata: dict[str, Any], *, document: str, chunk_id: str) -> dict[str, Any]:
+        text = cls._content_from_document(document)
+        record = {
+            "chunk_id": metadata.get("chunk_id") or chunk_id,
+            "file_name": metadata.get("file_name") or metadata.get("source_file"),
+            "source_file": metadata.get("source_file") or metadata.get("file_name"),
+            "source_path": metadata.get("source_path"),
+            "doc_type": metadata.get("doc_type"),
+            "chunk_type": metadata.get("chunk_type"),
+            "section_title": metadata.get("section_title"),
+            "section_key": metadata.get("section_key"),
+            "heading": metadata.get("heading"),
+            "page_number": metadata.get("page_number"),
+            "order_start": metadata.get("order_start"),
+            "order_end": metadata.get("order_end"),
+            "char_count": metadata.get("char_count") or len(text),
+            "text": text,
+            "retrieval_text": document,
+            "metadata": {
+                "source_block_count": cls._count_metadata_items(metadata.get("block_ids")),
+                "embedding_model": metadata.get("embedding_model"),
+                "normalized_embeddings": metadata.get("normalized_embeddings"),
+                "chroma_metadata": metadata,
+            },
+            "block_types": cls._json_list(metadata.get("block_types")),
+        }
+        return record
+
+    @staticmethod
+    def _content_from_document(document: str) -> str:
+        marker = "Content:"
+        if marker in document:
+            return document.split(marker, 1)[1].strip()
+        return document.strip()
+
+    @staticmethod
+    def _score_from_chroma_distance(distance: float) -> float:
+        # The collection is created with cosine space, where Chroma returns distance.
+        return 1.0 - distance
+
+    @staticmethod
+    def _json_list(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if not isinstance(value, str) or not value.strip():
+            return []
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    @classmethod
+    def _count_metadata_items(cls, value: Any) -> int:
+        parsed = cls._json_list(value)
+        return len(parsed) if parsed else 1
+
+    @staticmethod
+    def infer_chroma_model_name(collection: Any, default_model_name: str) -> str:
+        try:
+            result = collection.get(limit=1, include=["metadatas"])
+        except Exception:
+            return default_model_name
+
+        metadatas = result.get("metadatas") if isinstance(result, dict) else None
+        if isinstance(metadatas, list) and metadatas:
+            model_name = str((metadatas[0] or {}).get("embedding_model") or "").strip()
+            if model_name:
+                return model_name
+
+        return default_model_name
+
+    @staticmethod
+    def open_chroma_collection(
+        *,
+        persist_path: str | Path,
+        collection_name: str = DEFAULT_CHROMA_COLLECTION,
+    ) -> Any:
+        try:
+            import chromadb
+        except ImportError as exc:  # pragma: no cover
+            raise RuntimeError("chromadb is required to query the vector database.") from exc
+
+        client = chromadb.PersistentClient(path=str(persist_path))
+        return client.get_collection(name=collection_name)
+
     def _format_debug_result(self, reranked_result: dict[str, Any]) -> dict[str, Any]:
         record = reranked_result["record"]
         section_title = self._record_section_title(record)
         text = normalize_retrieved_text(str(record.get("text") or ""), section_title)
+        metadata = dict(record.get("metadata") or {})
         return {
             "score": round(reranked_result["final_score"], 6),
             "final_score": round(reranked_result["final_score"], 6),
             "raw_vector_score": round(reranked_result["raw_vector_score"], 6),
             "rerank_delta": round(reranked_result["rerank_delta"], 6),
             "reasons": reranked_result["reasons"],
+            "chroma_distance": record.get("_chroma_distance"),
             "chunk_id": record.get("chunk_id"),
             "file_name": record.get("file_name") or record.get("source_file"),
             "section_title": section_title,
             "page_number": record.get("page_number"),
             "chunk_length": len(text),
             "preview": self._preview(text),
+            "metadata": metadata.get("chroma_metadata", {}),
             "text": text,
         }
 
