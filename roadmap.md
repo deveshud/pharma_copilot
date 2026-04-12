@@ -72,12 +72,11 @@ Build a local-first RAG system that can ingest pharma and enterprise documents, 
 - [x] Ollama model, host, temperature, and context-window settings in sidebar.
 - [x] Low-level retrieval controls hidden from the user.
 - [x] Automatic retrieval before answer generation.
-- [x] Evidence metrics for context chunks, best matches, associated context, and embedding model.
-- [x] Retrieved chunk inspection tab.
-- [x] Grounded prompt inspection tab.
-- [x] JSON export for query, answer, prompt, and retrieved evidence.
+- [x] Clean answer-first layout without vector candidate, chunk count, or embedding-model boxes.
+- [x] Optional retrieved evidence expander.
+- [x] Optional grounded prompt expander.
 - [x] Streaming answer display.
-- [x] 0 to 100 progress bar during answer generation.
+- [x] Spinner with interim status updates during retrieval and answer generation.
 - [x] Streamlit watcher disabled to avoid optional `torchvision` import noise from `transformers`.
 
 ## Implemented Milestone Summary
@@ -131,11 +130,22 @@ Build a local-first RAG system that can ingest pharma and enterprise documents, 
 
 - [ ] Add one command or runner for the full pipeline: ingestion, chunking, embedding, and Chroma storage.
 - [ ] Add a Streamlit startup health panel for ChromaDB, collection count, inferred embedding model, Ollama availability, and selected Ollama model.
+- [ ] Create an answer-quality triage workflow for incorrect answers.
 - [ ] Improve error handling when the selected Ollama model has not been pulled.
 - [ ] Improve error handling when ChromaDB exists but the expected collection is missing.
 - [ ] Move retrieval constants into a config file.
 - [ ] Add tests for Streamlit helper functions that do not require launching the UI.
 - [ ] Document sample data setup more explicitly because `data/` is gitignored.
+
+### Answer Quality Recovery
+
+- [ ] Build a wrong-answer log with question, generated answer, expected answer, retrieved chunks, missing evidence, and failure reason.
+- [ ] Create a small failure-case benchmark from real incorrect answers before tuning prompts or retrieval settings.
+- [ ] Add retrieval hit-rate checks before answer generation so the system can detect when the right evidence was not retrieved.
+- [ ] Add an insufficient-context guard that blocks confident answers when retrieved evidence is weak, unrelated, or contradictory.
+- [ ] Add citation validation so every generated citation maps back to a retrieved chunk ID.
+- [ ] Add groundedness checks that flag claims not supported by retrieved context.
+- [ ] Track whether answer failures came from parsing, text normalization, chunking, embeddings, retrieval, reranking, or generation.
 
 ### Ingestion
 
@@ -154,9 +164,15 @@ Build a local-first RAG system that can ingest pharma and enterprise documents, 
 
 ### Chunking
 
+- [ ] Improve text normalization for broken line breaks, split words, repeated whitespace, bullets, headings, and punctuation artifacts.
+- [ ] Add normalization tests using real snippets from incorrect-answer cases.
+- [ ] Preserve table rows, column labels, section headings, and nearby explanatory text in the same retrieval unit where possible.
+- [ ] Avoid tiny heading-only chunks and oversized mixed-topic chunks.
+- [ ] Add parent-child chunking so retrieval can match a precise child chunk while passing the broader parent section to the LLM.
 - [ ] Add parent-child retrieval.
 - [ ] Add configurable section boundary rules.
 - [ ] Add a chunk quality report.
+- [ ] Report chunk length distribution, duplicate/noisy chunks, section coverage, table coverage, and source-document coverage.
 - [ ] Add chunk previews in an index inspection page.
 - [ ] Benchmark chunk sizes.
 - [ ] Benchmark overlap settings.
@@ -165,6 +181,10 @@ Build a local-first RAG system that can ingest pharma and enterprise documents, 
 
 - [ ] Add embedding model comparison reports.
 - [ ] Add model-specific retrieval benchmark results.
+- [ ] Compare embedding models against the wrong-answer benchmark, not only generic examples.
+- [ ] Evaluate domain-friendly query and document prefixes for embedding inputs.
+- [ ] Normalize retrieval text consistently before embedding and querying.
+- [ ] Add top-k recall measurements for expected source sections.
 - [ ] Add local model cache validation before embedding jobs.
 - [ ] Add embedding dimension checks before writing to existing Chroma collections.
 - [ ] Add batch progress reporting for large embedding runs.
@@ -210,9 +230,11 @@ Build a local-first RAG system that can ingest pharma and enterprise documents, 
 ### Evaluation
 
 - [ ] Create a benchmark question set.
+- [ ] Include known wrong-answer questions as regression cases.
 - [ ] Add expected answer notes.
 - [ ] Add expected source chunk or section labels.
 - [ ] Measure retrieval hit rate.
+- [ ] Measure whether expected evidence appears in top 3, top 5, and final associated context.
 - [ ] Measure citation accuracy.
 - [ ] Track answer groundedness.
 - [ ] Log failed queries and retrieved context.
