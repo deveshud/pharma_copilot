@@ -13,3 +13,4 @@ wheels/
 weekly_goals/
 data/
 parsed_outputs/
+outputs/chroma_db/

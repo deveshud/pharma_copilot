@@ -36,6 +36,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=5,
         help="Number of top results to return.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print score, section title, chunk length, and preview for ranked chunks.",
+    )
     return parser
 
 
@@ -51,7 +56,10 @@ def main() -> int:
         raise ValueError("Query cannot be empty.")
 
     retriever = LocalRetriever()
-    results = retriever.retrieve_from_file(query, input_path, top_k=args.top_k)
+    if args.debug:
+        results = retriever.retrieve_debug_from_file(query, input_path, top_k=args.top_k)
+    else:
+        results = retriever.retrieve_from_file(query, input_path, top_k=args.top_k)
     print(json.dumps(results, indent=2, ensure_ascii=False))
     return 0
 

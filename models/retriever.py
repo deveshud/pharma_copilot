@@ -1,20 +1,76 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 import math
 from pathlib import Path
+import re
 from typing import Any
 
 from sentence_transformers import SentenceTransformer
 
 from models.retrieval_encoder import RetrievalEncoder
+from utils.text_normalization import normalize_narrative_text, normalize_retrieved_text
+
+
+@dataclass(frozen=True)
+class RerankConfig:
+    scope_title_phrases: tuple[str, ...] = (
+        "project scope",
+        "out of scope",
+        "in scope",
+        "scope",
+    )
+    boilerplate_phrases: tuple[str, ...] = (
+        "individual project agreement",
+        "master services agreement",
+        "customer project contact",
+        "vendor project contact",
+        "effective upon acceptance",
+        "terms and conditions",
+        "capitalized terms",
+        "exit clause",
+        "termination",
+    )
+    admin_query_terms: frozenset[str] = field(
+        default_factory=lambda: frozenset(
+            {
+                "agreement",
+                "contract",
+                "customer",
+                "vendor",
+                "contact",
+                "effective",
+                "expiration",
+                "termination",
+                "msa",
+                "ipa",
+            }
+        )
+    )
+    scope_title_boost: float = 0.34
+    title_overlap_weight: float = 0.22
+    file_overlap_weight: float = 0.06
+    text_overlap_weight: float = 0.04
+    phrase_overlap_weight: float = 0.10
+    exact_query_boost: float = 0.12
+    heading_body_boost: float = 0.07
+    adjacent_section_boost: float = 0.04
+    tiny_chunk_penalty: float = 0.22
+    boilerplate_penalty: float = 0.55
+    broad_boilerplate_penalty: float = 0.20
+    project_scope_title_boost: float = 0.46
+    in_scope_title_boost: float = 0.38
+    out_scope_title_boost: float = 0.34
+    generic_scope_title_boost: float = 0.24
 
 
 class LocalRetriever:
     """Retrieve the most relevant chunks from a saved embeddings payload."""
 
-    def __init__(self, encoder: RetrievalEncoder | None = None) -> None:
+    def __init__(self, encoder: RetrievalEncoder | None = None, rerank_config: RerankConfig | None = None) -> None:
         self.encoder = encoder
+        self.rerank_config = rerank_config or RerankConfig()
 
     def load_embeddings_output(self, input_path: str | Path) -> dict[str, Any]:
         path = Path(input_path)
@@ -35,31 +91,17 @@ class LocalRetriever:
         *,
         top_k: int = 5,
     ) -> list[str]:
-        if top_k <= 0:
-            raise ValueError("top_k must be a positive integer.")
+        return [result["text"] for result in self.retrieve_debug(query, embeddings_payload, top_k=top_k)]
 
-        query_embedding = self._get_encoder(embeddings_payload).encode_query_text(query)
-        normalized_embeddings = bool(embeddings_payload.get("model", {}).get("normalized_embeddings"))
-
-        scored_results: list[tuple[float, dict[str, Any]]] = []
-        for record in embeddings_payload["records"]:
-            embedding = record.get("embedding")
-            if not isinstance(embedding, list):
-                continue
-
-            score = self._similarity_score(
-                query_embedding=query_embedding,
-                chunk_embedding=embedding,
-                normalized_embeddings=normalized_embeddings,
-            )
-            scored_results.append((score, record))
-
-        scored_results.sort(key=lambda item: item[0], reverse=True)
-
-        return [
-            str(record.get("text") or "")
-            for _, record in scored_results[:top_k]
-        ]
+    def retrieve_debug(
+        self,
+        query: str,
+        embeddings_payload: dict[str, Any],
+        *,
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        ranked_results = self._rank_records(query, embeddings_payload, top_k=top_k)
+        return [self._format_debug_result(result) for result in ranked_results]
 
     def retrieve_from_file(
         self,
@@ -70,6 +112,62 @@ class LocalRetriever:
     ) -> list[str]:
         embeddings_payload = self.load_embeddings_output(input_path)
         return self.retrieve(query, embeddings_payload, top_k=top_k)
+
+    def retrieve_debug_from_file(
+        self,
+        query: str,
+        input_path: str | Path,
+        *,
+        top_k: int = 5,
+    ) -> list[dict[str, Any]]:
+        embeddings_payload = self.load_embeddings_output(input_path)
+        return self.retrieve_debug(query, embeddings_payload, top_k=top_k)
+
+    def _rank_records(
+        self,
+        query: str,
+        embeddings_payload: dict[str, Any],
+        *,
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        if top_k <= 0:
+            raise ValueError("top_k must be a positive integer.")
+
+        query_embedding = self._get_encoder(embeddings_payload).encode_query_text(query)
+        normalized_embeddings = bool(embeddings_payload.get("model", {}).get("normalized_embeddings"))
+        records = [record for record in embeddings_payload["records"] if isinstance(record.get("embedding"), list)]
+
+        scored_results: list[dict[str, Any]] = []
+        for index, record in enumerate(records):
+            semantic_score = self._similarity_score(
+                query_embedding=query_embedding,
+                chunk_embedding=record["embedding"],
+                normalized_embeddings=normalized_embeddings,
+            )
+            rerank = self._rerank_record(query=query, record=record, raw_vector_score=semantic_score, records=records, index=index)
+            scored_results.append(rerank)
+
+        scored_results.sort(key=lambda item: item["final_score"], reverse=True)
+        return scored_results[:top_k]
+
+    def _format_debug_result(self, reranked_result: dict[str, Any]) -> dict[str, Any]:
+        record = reranked_result["record"]
+        section_title = self._record_section_title(record)
+        text = normalize_retrieved_text(str(record.get("text") or ""), section_title)
+        return {
+            "score": round(reranked_result["final_score"], 6),
+            "final_score": round(reranked_result["final_score"], 6),
+            "raw_vector_score": round(reranked_result["raw_vector_score"], 6),
+            "rerank_delta": round(reranked_result["rerank_delta"], 6),
+            "reasons": reranked_result["reasons"],
+            "chunk_id": record.get("chunk_id"),
+            "file_name": record.get("file_name") or record.get("source_file"),
+            "section_title": section_title,
+            "page_number": record.get("page_number"),
+            "chunk_length": len(text),
+            "preview": self._preview(text),
+            "text": text,
+        }
 
     def _get_encoder(self, embeddings_payload: dict[str, Any]) -> RetrievalEncoder:
         if self.encoder is not None:
@@ -111,6 +209,194 @@ class LocalRetriever:
             return None
 
         return snapshots[0]
+
+    def _rerank_record(
+        self,
+        *,
+        query: str,
+        record: dict[str, Any],
+        raw_vector_score: float,
+        records: list[dict[str, Any]],
+        index: int,
+    ) -> dict[str, Any]:
+        rerank_delta, reasons = self._metadata_rerank_delta(query=query, record=record, records=records, index=index)
+        return {
+            "final_score": raw_vector_score + rerank_delta,
+            "raw_vector_score": raw_vector_score,
+            "rerank_delta": rerank_delta,
+            "reasons": reasons,
+            "record": record,
+        }
+
+    def _metadata_rerank_delta(
+        self,
+        *,
+        query: str,
+        record: dict[str, Any],
+        records: list[dict[str, Any]],
+        index: int,
+    ) -> tuple[float, list[str]]:
+        config = self.rerank_config
+        query_text = normalize_narrative_text(query).lower()
+        query_tokens = self._tokens(query_text)
+        if not query_tokens:
+            return 0.0, []
+
+        reasons: list[str] = []
+        section_title = self._record_section_title(record)
+        text = normalize_retrieved_text(str(record.get("text") or ""), section_title).lower()
+        file_name = normalize_narrative_text(str(record.get("file_name") or record.get("source_file") or "")).lower()
+        combined_text = " ".join(part for part in [section_title.lower(), file_name, text] if part)
+
+        title_overlap = self._token_overlap(query_tokens, self._tokens(section_title.lower()))
+        file_overlap = self._token_overlap(query_tokens, self._tokens(file_name))
+        text_overlap = self._token_overlap(query_tokens, self._tokens(text))
+        phrase_overlap = self._phrase_overlap(query_tokens, combined_text)
+        delta = 0.0
+
+        scope_boost = self._scope_section_boost(query_tokens, section_title)
+        if scope_boost:
+            delta += scope_boost
+            reasons.append(f"boost:scope_section(+{scope_boost:.2f})")
+
+        title_boost = config.title_overlap_weight * title_overlap
+        if title_boost > 0:
+            delta += title_boost
+            reasons.append(f"boost:title_overlap(+{title_boost:.2f})")
+
+        file_boost = config.file_overlap_weight * file_overlap
+        if file_boost > 0:
+            delta += file_boost
+            reasons.append(f"boost:file_overlap(+{file_boost:.2f})")
+
+        text_boost = config.text_overlap_weight * text_overlap
+        if text_boost > 0:
+            delta += text_boost
+            reasons.append(f"boost:text_overlap(+{text_boost:.2f})")
+
+        phrase_boost = config.phrase_overlap_weight * phrase_overlap
+        if phrase_boost > 0:
+            delta += phrase_boost
+            reasons.append(f"boost:phrase_overlap(+{phrase_boost:.2f})")
+
+        if query_text and query_text in combined_text:
+            delta += config.exact_query_boost
+            reasons.append(f"boost:exact_query(+{config.exact_query_boost:.2f})")
+
+        text_len = len(text)
+        has_heading_and_body = bool(section_title and text_len > max(120, len(section_title) + 40))
+        if has_heading_and_body:
+            delta += config.heading_body_boost
+            reasons.append(f"boost:heading_body(+{config.heading_body_boost:.2f})")
+
+        if self._has_adjacent_section_match(records, index, section_title) and self._query_matches_section(query_tokens, section_title):
+            delta += config.adjacent_section_boost
+            reasons.append(f"boost:adjacent_section(+{config.adjacent_section_boost:.2f})")
+
+        if text_len < 80 and int(dict(record.get("metadata") or {}).get("source_block_count", 1)) <= 1:
+            delta -= config.tiny_chunk_penalty
+            reasons.append(f"penalty:tiny_chunk(-{config.tiny_chunk_penalty:.2f})")
+
+        if self._is_boilerplate_content(combined_text) and not self._is_admin_query(query_tokens):
+            delta -= config.boilerplate_penalty
+            reasons.append(f"penalty:boilerplate(-{config.boilerplate_penalty:.2f})")
+
+        if self._is_broad_boilerplate(record=record, text=text, section_title=section_title) and not self._is_admin_query(query_tokens):
+            delta -= config.broad_boilerplate_penalty
+            reasons.append(f"penalty:broad_boilerplate(-{config.broad_boilerplate_penalty:.2f})")
+
+        return delta, reasons
+
+    def _is_scope_section(self, section_title: str) -> bool:
+        normalized_title = section_title.lower()
+        return any(phrase in normalized_title for phrase in self.rerank_config.scope_title_phrases)
+
+    def _scope_section_boost(self, query_tokens: list[str], section_title: str) -> float:
+        if not self._is_scope_query(query_tokens) or not self._is_scope_section(section_title):
+            return 0.0
+
+        config = self.rerank_config
+        normalized_title = section_title.lower()
+        query_set = set(query_tokens)
+        if "project scope" in normalized_title:
+            return config.project_scope_title_boost
+        if "out of scope" in normalized_title:
+            return config.out_scope_title_boost if "out" in query_set else config.generic_scope_title_boost
+        if "in scope" in normalized_title:
+            return config.in_scope_title_boost
+        return config.generic_scope_title_boost
+
+    @staticmethod
+    def _is_scope_query(query_tokens: list[str]) -> bool:
+        query_set = set(query_tokens)
+        return bool(query_set.intersection({"scope", "scoped", "inscope"}))
+
+    def _query_matches_section(self, query_tokens: list[str], section_title: str) -> bool:
+        return self._token_overlap(query_tokens, self._tokens(section_title)) >= 0.25
+
+    def _has_adjacent_section_match(self, records: list[dict[str, Any]], index: int, section_title: str) -> bool:
+        if not section_title:
+            return False
+        for adjacent_index in (index - 1, index + 1):
+            if 0 <= adjacent_index < len(records) and self._record_section_title(records[adjacent_index]).lower() == section_title.lower():
+                return True
+        return False
+
+    def _is_boilerplate_content(self, combined_text: str) -> bool:
+        return any(phrase in combined_text for phrase in self.rerank_config.boilerplate_phrases)
+
+    def _is_admin_query(self, query_tokens: list[str]) -> bool:
+        return bool(set(query_tokens).intersection(self.rerank_config.admin_query_terms))
+
+    def _is_broad_boilerplate(self, *, record: dict[str, Any], text: str, section_title: str) -> bool:
+        title = section_title.lower()
+        block_types = {str(block_type).lower() for block_type in record.get("block_types", [])}
+        boilerplate_title = title in {"individual project agreement", "master services agreement"} or title.startswith(
+            ("title of project", "customer", "vendor", "effective date", "expiration date")
+        )
+        broad_text = len(text) > 500 and len(self._tokens(text)) > 90
+        sparse_section = not self._is_scope_section(section_title) and not block_types.intersection({"table", "row"})
+        return boilerplate_title or (broad_text and sparse_section and self._is_boilerplate_content(text))
+
+    @staticmethod
+    def _record_section_title(record: dict[str, Any]) -> str:
+        return normalize_narrative_text(
+            str(record.get("section_title") or record.get("heading") or record.get("section_key") or "")
+        ).rstrip(":")
+
+    @staticmethod
+    def _tokens(text: str) -> list[str]:
+        return re.findall(r"[a-z0-9]+", text.lower())
+
+    @staticmethod
+    def _token_overlap(query_tokens: list[str], candidate_tokens: list[str]) -> float:
+        if not query_tokens or not candidate_tokens:
+            return 0.0
+        query_set = set(query_tokens)
+        return len(query_set.intersection(candidate_tokens)) / len(query_set)
+
+    @staticmethod
+    def _phrase_overlap(query_tokens: list[str], candidate_text: str) -> float:
+        if len(query_tokens) < 2:
+            return 0.0
+
+        phrases: list[str] = []
+        for size in (3, 2):
+            phrases.extend(" ".join(query_tokens[index:index + size]) for index in range(len(query_tokens) - size + 1))
+
+        if not phrases:
+            return 0.0
+
+        normalized_candidate = " ".join(LocalRetriever._tokens(candidate_text))
+        matches = sum(1 for phrase in phrases if phrase in normalized_candidate)
+        return matches / len(phrases)
+
+    @staticmethod
+    def _preview(text: str, max_chars: int = 260) -> str:
+        text = normalize_narrative_text(text)
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 3].rstrip() + "..."
 
     @staticmethod
     def _similarity_score(

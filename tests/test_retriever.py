@@ -71,3 +71,189 @@ def test_retriever_uses_cosine_when_embeddings_are_not_normalized() -> None:
         "Project scope and deliverables.",
         "Risk register and mitigations.",
     ]
+
+
+def test_retriever_normalizes_legacy_word_split_result_text() -> None:
+    payload = make_payload()
+    payload["records"][0]["heading"] = "Out of scope"  # type: ignore[index]
+    payload["records"][0]["text"] = (  # type: ignore[index]
+        "Out of scope\n\nAny\n\nnew\n\ndata\n\ningestion,\n\ndata\n\ntransformations,\n\nor\n\n"
+        "data\n\nassets\n\n(CADs/RRDs)\n\noutside\n\nthe\n\nscope."
+    )
+    retriever = LocalRetriever(encoder=FakeEncoder())  # type: ignore[arg-type]
+
+    results = retriever.retrieve("What is in scope?", payload, top_k=1)
+
+    assert results == [
+        "Out of scope: Any new data ingestion, data transformations, or data assets (CADs/RRDs) outside the scope."
+    ]
+
+
+def test_retriever_boosts_section_context_and_penalizes_tiny_chunks() -> None:
+    payload = make_payload()
+    payload["records"] = [
+        {
+            "chunk_id": "chunk_tiny",
+            "source_file": "PSS AR KPI Enablement through ICI Snowflake.docx",
+            "section_title": "Project Scope",
+            "heading": "Project Scope:",
+            "text": "Project Scope:",
+            "metadata": {"source_block_count": 1},
+            "embedding": [0.99, 0.01, 0.0],
+        },
+        {
+            "chunk_id": "chunk_scope",
+            "source_file": "PSS AR KPI Enablement through ICI Snowflake.docx",
+            "section_title": "Project Scope",
+            "heading": "Project Scope:",
+            "text": (
+                "Project Scope: The following activities are in scope for this engagement. "
+                "Requirements Gathering and Onboarding: Structured onboarding to the Sanofi analytics ecosystem."
+            ),
+            "metadata": {"source_block_count": 4},
+            "embedding": [0.95, 0.05, 0.0],
+        },
+    ]
+    retriever = LocalRetriever(encoder=FakeEncoder())  # type: ignore[arg-type]
+
+    results = retriever.retrieve_debug("PSS A&R KPI Enablement Scope", payload, top_k=2)
+
+    assert results[0]["chunk_id"] == "chunk_scope"
+    assert results[0]["section_title"] == "Project Scope"
+    assert results[0]["chunk_length"] > 80
+    assert "The following activities are in scope" in results[0]["preview"]
+
+
+def test_retriever_demotes_boilerplate_for_scope_queries() -> None:
+    payload = make_payload()
+    payload["records"] = [
+        {
+            "chunk_id": "chunk_admin",
+            "source_file": "PSS AR KPI Enablement through ICI Snowflake.docx",
+            "section_title": "INDIVIDUAL PROJECT AGREEMENT (IPA)",
+            "heading": "INDIVIDUAL PROJECT AGREEMENT (IPA)",
+            "text": (
+                "INDIVIDUAL PROJECT AGREEMENT (IPA) under Master Services Agreement. "
+                "Customer Project Contact: Jane Doe. Vendor Project Contact: John Smith. "
+                "The following terms and conditions apply solely to work performed under this IPA."
+            ),
+            "metadata": {"source_block_count": 7},
+            "embedding": [0.99, 0.01, 0.0],
+        },
+        {
+            "chunk_id": "chunk_scope",
+            "source_file": "PSS AR KPI Enablement through ICI Snowflake.docx",
+            "section_title": "Project Scope",
+            "heading": "Project Scope:",
+            "text": (
+                "Project Scope: The following activities are in scope for this engagement. "
+                "Requirements Gathering and Onboarding: Structured onboarding to the Sanofi analytics ecosystem."
+            ),
+            "metadata": {"source_block_count": 4},
+            "embedding": [0.93, 0.07, 0.0],
+        },
+    ]
+    retriever = LocalRetriever(encoder=FakeEncoder())  # type: ignore[arg-type]
+
+    results = retriever.retrieve_debug("PSS A&R KPI Enablement Scope", payload, top_k=2)
+
+    assert results[0]["chunk_id"] == "chunk_scope"
+    assert any(reason.startswith("boost:scope_section") for reason in results[0]["reasons"])
+    assert results[1]["chunk_id"] == "chunk_admin"
+    assert any(reason.startswith("penalty:boilerplate") for reason in results[1]["reasons"])
+    assert results[1]["raw_vector_score"] > results[0]["raw_vector_score"]
+    assert results[1]["final_score"] < results[0]["final_score"]
+
+
+def test_retriever_prioritizes_project_scope_for_generic_scope_query() -> None:
+    payload = make_payload()
+    payload["records"] = [
+        {
+            "chunk_id": "chunk_out_scope",
+            "source_file": "PSS AR KPI Enablement through ICI Snowflake.docx",
+            "section_title": "Out of scope",
+            "heading": "Out of scope",
+            "text": "Out of scope: New data ingestion and new dashboard development are outside scope.",
+            "metadata": {"source_block_count": 3},
+            "embedding": [0.99, 0.01, 0.0],
+        },
+        {
+            "chunk_id": "chunk_project_scope",
+            "source_file": "PSS AR KPI Enablement through ICI Snowflake.docx",
+            "section_title": "Project Scope",
+            "heading": "Project Scope:",
+            "text": (
+                "Project Scope: The following activities are in scope for this engagement. "
+                "Requirements gathering and mapping are included."
+            ),
+            "metadata": {"source_block_count": 4},
+            "embedding": [0.93, 0.07, 0.0],
+        },
+    ]
+    retriever = LocalRetriever(encoder=FakeEncoder())  # type: ignore[arg-type]
+
+    results = retriever.retrieve_debug("PSS A&R KPI Enablement Scope", payload, top_k=2)
+
+    assert results[0]["chunk_id"] == "chunk_project_scope"
+    assert any("boost:scope_section(+0.46)" in reason for reason in results[0]["reasons"])
+    assert any("boost:scope_section(+0.24)" in reason for reason in results[1]["reasons"])
+
+
+def test_retriever_prioritizes_out_of_scope_when_query_says_out() -> None:
+    payload = make_payload()
+    payload["records"] = [
+        {
+            "chunk_id": "chunk_out_scope",
+            "source_file": "proposal.docx",
+            "section_title": "Out of scope",
+            "heading": "Out of scope",
+            "text": "Out of scope: New data ingestion and dashboard development are excluded.",
+            "metadata": {"source_block_count": 3},
+            "embedding": [0.95, 0.05, 0.0],
+        },
+        {
+            "chunk_id": "chunk_project_scope",
+            "source_file": "proposal.docx",
+            "section_title": "Project Scope",
+            "heading": "Project Scope:",
+            "text": "Project Scope: Requirements gathering and mapping are included.",
+            "metadata": {"source_block_count": 3},
+            "embedding": [0.95, 0.05, 0.0],
+        },
+    ]
+    retriever = LocalRetriever(encoder=FakeEncoder())  # type: ignore[arg-type]
+
+    results = retriever.retrieve_debug("What is out of scope?", payload, top_k=2)
+
+    assert results[0]["chunk_id"] == "chunk_out_scope"
+    assert any("boost:scope_section(+0.34)" in reason for reason in results[0]["reasons"])
+
+
+def test_retriever_keeps_boilerplate_available_for_admin_queries() -> None:
+    payload = make_payload()
+    payload["records"] = [
+        {
+            "chunk_id": "chunk_admin",
+            "source_file": "proposal.docx",
+            "section_title": "INDIVIDUAL PROJECT AGREEMENT (IPA)",
+            "heading": "INDIVIDUAL PROJECT AGREEMENT (IPA)",
+            "text": "INDIVIDUAL PROJECT AGREEMENT (IPA) under Master Services Agreement. Customer Project Contact: Jane Doe.",
+            "metadata": {"source_block_count": 4},
+            "embedding": [0.0, 0.98, 0.0],
+        },
+        {
+            "chunk_id": "chunk_scope",
+            "source_file": "proposal.docx",
+            "section_title": "Project Scope",
+            "heading": "Project Scope:",
+            "text": "Project Scope: Requirements mapping and validation are in scope.",
+            "metadata": {"source_block_count": 3},
+            "embedding": [0.0, 0.9, 0.0],
+        },
+    ]
+    retriever = LocalRetriever(encoder=FakeEncoder())  # type: ignore[arg-type]
+
+    results = retriever.retrieve_debug("Who is the customer project contact?", payload, top_k=2)
+
+    assert results[0]["chunk_id"] == "chunk_admin"
+    assert not any(reason.startswith("penalty:boilerplate") for reason in results[0]["reasons"])

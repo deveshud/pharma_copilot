@@ -73,6 +73,119 @@ def test_structural_chunker_groups_body_by_section_and_keeps_tables_separate() -
     assert chunks[3]["block_ids"] == ["h2", "p3"]
 
 
+def test_structural_chunker_renders_section_text_as_normalized_narrative() -> None:
+    blocks = [
+        make_block(block_id="h1", order=1, text="Out of scope", block_type="heading", section_path=["Out of scope"]),
+        make_block(
+            block_id="p1",
+            order=2,
+            text=(
+                "Any new data ingestion, data transformations, or data assets "
+                "(CADs/RRDs) outside the scope of PSS A&R application requirements are not in scope"
+            ),
+            section_path=["Out of scope"],
+        ),
+        make_block(
+            block_id="p2",
+            order=3,
+            text="Data assets virtualization or semantic layer design/development is outside the scope of this program",
+            section_path=["Out of scope"],
+        ),
+        make_block(
+            block_id="p3",
+            order=4,
+            text="Design and development of PADs/process aligned data assets is not in scope of this program",
+            section_path=["Out of scope"],
+        ),
+    ]
+
+    chunks = StructuralChunker(max_chars=1000, tokenizer=FakeTokenizer()).chunk_file_blocks(blocks)
+
+    assert chunks[0]["text"] == (
+        "Out of scope: Any new data ingestion, data transformations, or data assets "
+        "(CADs/RRDs) outside the scope of PSS A&R application requirements are not in scope. "
+        "Data assets virtualization or semantic layer design/development is outside the scope of this program. "
+        "Design and development of PADs/process aligned data assets is not in scope of this program."
+    )
+    assert "\n\nAny\n\nnew" not in chunks[0]["text"]
+
+
+def test_structural_chunker_merges_short_heading_only_context_into_sections() -> None:
+    blocks = [
+        make_block(block_id="h1", order=1, text="Project Scope:", block_type="heading", section_path=["Project Scope:"]),
+        make_block(
+            block_id="h2",
+            order=2,
+            text="The following activities are in scope for this engagement",
+            block_type="heading",
+            section_path=["The following activities are in scope for this engagement"],
+        ),
+        make_block(
+            block_id="h3",
+            order=3,
+            text="Requirements Gathering and Onboarding",
+            block_type="heading",
+            section_path=["Requirements Gathering and Onboarding"],
+        ),
+        make_block(
+            block_id="p1",
+            order=4,
+            text="Structured onboarding to the Sanofi analytics ecosystem and documented design rationale",
+            section_path=["Requirements Gathering and Onboarding"],
+        ),
+        make_block(
+            block_id="h4",
+            order=5,
+            text="Validation/signoff of PSS A&R mappings by Sanofi Hub team",
+            block_type="heading",
+            section_path=["Validation/signoff of PSS A&R mappings by Sanofi Hub team"],
+        ),
+        make_block(
+            block_id="h5",
+            order=6,
+            text="Archetyping & Design",
+            block_type="heading",
+            section_path=["Archetyping & Design"],
+        ),
+        make_block(
+            block_id="p2",
+            order=7,
+            text="Identification and finalization of CADs and RRD archetypes based on approved requirements",
+            section_path=["Archetyping & Design"],
+        ),
+    ]
+
+    chunks = StructuralChunker(max_chars=1000, tokenizer=FakeTokenizer()).chunk_file_blocks(blocks)
+
+    assert len(chunks) == 2
+    assert chunks[0]["section_title"] == "Project Scope"
+    assert chunks[0]["file_name"] == "sample.docx"
+    assert chunks[0]["page_number"] is None
+    assert chunks[0]["block_ids"] == ["h1", "h2", "h3", "p1", "h4"]
+    assert chunks[0]["text"].startswith("Project Scope: The following activities are in scope")
+    assert "Requirements Gathering and Onboarding" in chunks[0]["text"]
+    assert "Validation/signoff of PSS A&R mappings by Sanofi Hub team" in chunks[0]["text"]
+    assert chunks[1]["section_title"] == "Archetyping & Design"
+
+
+def test_structural_chunker_treats_short_colon_paragraph_as_heading() -> None:
+    blocks = [
+        make_block(block_id="p1", order=1, text="Project Scope:", section_path=[]),
+        make_block(
+            block_id="p2",
+            order=2,
+            text="The engagement includes requirements mapping and validation.",
+            section_path=[],
+        ),
+    ]
+
+    chunks = StructuralChunker(max_chars=1000, tokenizer=FakeTokenizer()).chunk_file_blocks(blocks)
+
+    assert chunks[0]["section_title"] == "Project Scope"
+    assert chunks[0]["block_types"] == ["heading", "paragraph"]
+    assert chunks[0]["text"] == "Project Scope: The engagement includes requirements mapping and validation."
+
+
 def test_structural_chunker_splits_large_sections_without_losing_traceability() -> None:
     long_text = (
         "Sentence one keeps the topic grounded. "

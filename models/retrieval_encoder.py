@@ -57,14 +57,18 @@ class RetrievalEncoder:
     def build_retrieval_text(self, chunk: dict[str, Any]) -> str:
         section_path = chunk.get("section_path") or []
         section_text = " > ".join(str(part) for part in section_path if part)
+        explicit_section_title = str(chunk.get("section_title") or "").strip()
+        section_title = explicit_section_title or str(chunk.get("heading") or "").strip()
         heading = chunk.get("heading")
         text = str(chunk.get("text") or "").strip()
 
         lines = [
-            f"Source File: {chunk.get('source_file', '')}",
+            f"Source File: {chunk.get('file_name') or chunk.get('source_file', '')}",
             f"Chunk Type: {chunk.get('chunk_type', '')}",
         ]
 
+        if explicit_section_title:
+            lines.append(f"Section Title: {section_title}")
         if section_text:
             lines.append(f"Section Path: {section_text}")
         if heading and not self._text_contains_heading(text, str(heading)):

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 import json
 import re
 import textwrap
+
+from utils.text_normalization import clean_text, join_narrative_parts, normalize_narrative_text, render_heading_with_body
 
 try:
     from transformers import AutoTokenizer
@@ -50,7 +52,7 @@ class NormalizedBlock:
             doc_type=str(block.get("doc_type", "")).strip(),
             block_type=str(block.get("block_type", "")).strip().lower(),
             order=int(block.get("order", 0)),
-            text=_clean_text(block.get("text", "")),
+            text=clean_text(block.get("text", "")),
             section_path=section_path,
             page_number=_coerce_int(block.get("page_number")),
             slide_number=_coerce_int(block.get("slide_number")),
@@ -96,6 +98,7 @@ class StructuralChunker:
         overlap_tokens: int = 40,
         heading_block_types: Iterable[str] | None = None,
         table_block_types: Iterable[str] | None = None,
+        min_section_chars: int = 120,
         tokenizer_name: str = DEFAULT_TOKENIZER_MODEL,
         tokenizer: Any | None = None,
     ) -> None:
@@ -105,6 +108,8 @@ class StructuralChunker:
             raise ValueError("max_tokens must be a positive integer when provided.")
         if overlap_tokens < 0:
             raise ValueError("overlap_tokens must be zero or greater.")
+        if min_section_chars < 0:
+            raise ValueError("min_section_chars must be zero or greater.")
 
         heading_types = heading_block_types or {"heading", "title", "header"}
         table_types = table_block_types or {"table"}
@@ -114,6 +119,7 @@ class StructuralChunker:
         self.overlap_tokens = overlap_tokens
         self.heading_block_types = {block_type.lower() for block_type in heading_types}
         self.table_block_types = {block_type.lower() for block_type in table_types}
+        self.min_section_chars = min_section_chars
         self.tokenizer_name = tokenizer_name
         self.tokenizer = tokenizer or self._load_tokenizer(tokenizer_name)
 
@@ -164,10 +170,12 @@ class StructuralChunker:
         for block in normalized_blocks:
             if not block.text:
                 continue
+            if self._is_inferred_heading(block):
+                block = replace(block, block_type="heading", section_path=block.section_path or (block.text,))
 
             block_section_path = block.section_path or current_section_path
 
-            if block.block_type in self.heading_block_types:
+            if self._is_heading_block(block):
                 flush_section(clear_context=True)
                 current_heading = block
                 current_section_path = block.section_path or (block.text,)
@@ -220,7 +228,7 @@ class StructuralChunker:
                 current_body_segments.append(segment)
 
         flush_section(clear_context=True)
-        return chunks
+        return self._merge_short_context_chunks(chunks)
 
     def chunk_consolidated_blocks(self, consolidated_blocks: ConsolidatedBlocks) -> Dict[str, List[ChunkDict]]:
         chunked_output: Dict[str, List[ChunkDict]] = {}
@@ -348,12 +356,14 @@ class StructuralChunker:
     ) -> ChunkDict:
         return {
             "chunk_id": f"{file_context['source_file']}::chunk_{chunk_index:04d}",
+            "file_name": file_context["source_file"],
             "source_file": file_context["source_file"],
             "source_path": file_context["source_path"],
             "doc_type": file_context["doc_type"],
             "chunk_type": chunk_type,
             "section_path": list(section_path),
             "section_key": " > ".join(section_path),
+            "section_title": self._section_title(heading, section_path),
             "heading": heading,
             "text": text,
             "char_count": len(text),
@@ -361,6 +371,9 @@ class StructuralChunker:
             "block_types": self._ordered_unique([segment.block_type for segment in segments]),
             "order_start": min(segment.order for segment in segments),
             "order_end": max(segment.order for segment in segments),
+            "page_number": self._first_or_none(
+                sorted({segment.page_number for segment in segments if segment.page_number is not None})
+            ),
             "page_numbers": sorted({segment.page_number for segment in segments if segment.page_number is not None}),
             "slide_numbers": sorted({segment.slide_number for segment in segments if segment.slide_number is not None}),
             "shape_indices": sorted({segment.shape_index for segment in segments if segment.shape_index is not None}),
@@ -399,13 +412,8 @@ class StructuralChunker:
         heading: NormalizedBlock | None,
         body_segments: Sequence[_ChunkSegment],
     ) -> str:
-        parts: List[str] = []
-
-        if heading is not None and heading.text:
-            parts.append(heading.text)
-
-        parts.extend(segment.text for segment in body_segments if segment.text)
-        return "\n\n".join(parts)
+        body_parts = [segment.text for segment in body_segments if segment.text]
+        return render_heading_with_body(heading.text if heading else None, body_parts)
 
     def _body_char_budget(self, heading: NormalizedBlock | None) -> int:
         if heading is None or not heading.text:
@@ -465,6 +473,40 @@ class StructuralChunker:
 
         return groups
 
+    def _merge_short_context_chunks(self, chunks: Sequence[ChunkDict]) -> List[ChunkDict]:
+        merged_chunks: List[ChunkDict] = []
+        pending_prefixes: List[ChunkDict] = []
+
+        for chunk in chunks:
+            if self._is_short_standalone_section(chunk):
+                # Colon headings usually introduce the next section; other short orphan
+                # headings attach backward unless they are part of an existing prefix chain.
+                if pending_prefixes or self._should_prefix_short_section(chunk) or not merged_chunks:
+                    pending_prefixes.append(chunk)
+                elif self._fits_within_budget(self._merged_text(merged_chunks[-1], chunk)):
+                    merged_chunks[-1] = self._merge_chunk_pair(merged_chunks[-1], chunk, position="suffix")
+                else:
+                    pending_prefixes.append(chunk)
+                continue
+
+            if pending_prefixes:
+                chunk = self._merge_prefix_chunks(pending_prefixes, chunk)
+                pending_prefixes = []
+
+            merged_chunks.append(chunk)
+
+        if pending_prefixes:
+            if merged_chunks:
+                for prefix in pending_prefixes:
+                    if self._fits_within_budget(self._merged_text(merged_chunks[-1], prefix)):
+                        merged_chunks[-1] = self._merge_chunk_pair(merged_chunks[-1], prefix, position="suffix")
+                    else:
+                        merged_chunks.append(prefix)
+            else:
+                merged_chunks.extend(pending_prefixes)
+
+        return self._renumber_chunks(merged_chunks)
+
     def _select_overlap_segments(self, segments: Sequence[_ChunkSegment]) -> List[_ChunkSegment]:
         if self.overlap_tokens <= 0 or not segments:
             return []
@@ -501,7 +543,7 @@ class StructuralChunker:
         return trimmed_overlap
 
     def _split_table_text(self, text: str, sticky_header: str | None = None) -> List[str]:
-        cleaned_text = _clean_text(text)
+        cleaned_text = clean_text(text)
         if not cleaned_text:
             return []
 
@@ -535,9 +577,11 @@ class StructuralChunker:
         max_tokens: int | None,
         prefer_lines: bool = False,
     ) -> List[str]:
-        cleaned_text = _clean_text(text)
+        cleaned_text = clean_text(text)
         if not cleaned_text:
             return []
+        if self._fits_within_budget(cleaned_text, max_chars=max_chars, max_tokens=max_tokens):
+            return [cleaned_text]
 
         unit_builders = [
             [part.strip() for part in re.split(r"\n{2,}", cleaned_text) if part.strip()],
@@ -581,7 +625,7 @@ class StructuralChunker:
         max_tokens: int | None,
         prefer_lines: bool = False,
     ) -> List[str]:
-        cleaned_text = _clean_text(text)
+        cleaned_text = clean_text(text)
         if not cleaned_text:
             return []
 
@@ -695,6 +739,143 @@ class StructuralChunker:
         except Exception:
             return None
 
+    def _is_short_standalone_section(self, chunk: Mapping[str, Any]) -> bool:
+        if chunk.get("chunk_type") != "section":
+            return False
+
+        block_types = {str(block_type).lower() for block_type in chunk.get("block_types", [])}
+        if not block_types or not block_types.issubset(self.heading_block_types):
+            return False
+
+        text = normalize_narrative_text(str(chunk.get("text") or ""))
+        if not text:
+            return False
+
+        return len(text) < self.min_section_chars
+
+    def _is_heading_block(self, block: NormalizedBlock) -> bool:
+        return block.block_type in self.heading_block_types
+
+    @staticmethod
+    def _is_inferred_heading(block: NormalizedBlock) -> bool:
+        text = normalize_narrative_text(block.text)
+        if not text.endswith(":"):
+            return False
+        if block.block_type in {"table", "row", "page_text", "document_metadata", "workbook_metadata"}:
+            return False
+        return len(text) <= 120 and len(text.split()) <= 12
+
+    @staticmethod
+    def _should_prefix_short_section(chunk: Mapping[str, Any]) -> bool:
+        text = normalize_narrative_text(str(chunk.get("text") or ""))
+        lowered = text.lower().rstrip(":")
+        return text.endswith(":") or lowered.startswith(("the following", "following ", "scope includes"))
+
+    def _merge_prefix_chunks(self, prefixes: Sequence[ChunkDict], chunk: ChunkDict) -> ChunkDict:
+        merged = dict(chunk)
+        for prefix in reversed(prefixes):
+            merged = self._merge_chunk_pair(prefix, merged, position="prefix")
+        return merged
+
+    def _merge_chunk_pair(self, left: Mapping[str, Any], right: Mapping[str, Any], *, position: str) -> ChunkDict:
+        left_text = normalize_narrative_text(str(left.get("text") or ""))
+        right_text = normalize_narrative_text(str(right.get("text") or ""))
+        merged_text = join_narrative_parts([left_text, right_text])
+
+        left_path = [str(part) for part in left.get("section_path", []) if str(part).strip()]
+        right_path = [str(part) for part in right.get("section_path", []) if str(part).strip()]
+        merged_path = self._ordered_unique([*left_path, *right_path]) if position == "prefix" else left_path
+        heading = self._merged_heading(left, right, position=position)
+
+        page_numbers = sorted(
+            {
+                *[int(page) for page in left.get("page_numbers", []) if page is not None],
+                *[int(page) for page in right.get("page_numbers", []) if page is not None],
+            }
+        )
+        metadata = {
+            **dict(left.get("metadata") or {}),
+            **dict(right.get("metadata") or {}),
+            "source_block_count": len(self._ordered_unique([*left.get("block_ids", []), *right.get("block_ids", [])])),
+            "merged_short_context_chunks": int(dict(left.get("metadata") or {}).get("merged_short_context_chunks", 0))
+            + int(dict(right.get("metadata") or {}).get("merged_short_context_chunks", 0))
+            + 1,
+        }
+
+        merged = dict(right if position == "prefix" else left)
+        merged.update(
+            {
+                "section_path": merged_path,
+                "section_key": " > ".join(merged_path),
+                "section_title": self._section_title(heading, tuple(merged_path)),
+                "heading": heading,
+                "text": merged_text,
+                "char_count": len(merged_text),
+                "block_ids": self._ordered_unique([*left.get("block_ids", []), *right.get("block_ids", [])]),
+                "block_types": self._ordered_unique([*left.get("block_types", []), *right.get("block_types", [])]),
+                "order_start": min(int(left.get("order_start", 0)), int(right.get("order_start", 0))),
+                "order_end": max(int(left.get("order_end", 0)), int(right.get("order_end", 0))),
+                "page_number": self._first_or_none(page_numbers),
+                "page_numbers": page_numbers,
+                "slide_numbers": sorted(
+                    {
+                        *[int(slide) for slide in left.get("slide_numbers", []) if slide is not None],
+                        *[int(slide) for slide in right.get("slide_numbers", []) if slide is not None],
+                    }
+                ),
+                "shape_indices": sorted(
+                    {
+                        *[int(index) for index in left.get("shape_indices", []) if index is not None],
+                        *[int(index) for index in right.get("shape_indices", []) if index is not None],
+                    }
+                ),
+                "sheet_names": self._ordered_unique([*left.get("sheet_names", []), *right.get("sheet_names", [])]),
+                "row_numbers": sorted(
+                    {
+                        *[int(row) for row in left.get("row_numbers", []) if row is not None],
+                        *[int(row) for row in right.get("row_numbers", []) if row is not None],
+                    }
+                ),
+                "metadata": metadata,
+            }
+        )
+        return merged
+
+    @staticmethod
+    def _merged_heading(left: Mapping[str, Any], right: Mapping[str, Any], *, position: str) -> str | None:
+        if position == "prefix":
+            return str(left.get("section_title") or left.get("heading") or "").strip() or str(right.get("heading") or "").strip() or None
+        return str(left.get("heading") or left.get("section_title") or "").strip() or str(right.get("heading") or "").strip() or None
+
+    @staticmethod
+    def _merged_text(left: Mapping[str, Any], right: Mapping[str, Any]) -> str:
+        return join_narrative_parts(
+            [
+                normalize_narrative_text(str(left.get("text") or "")),
+                normalize_narrative_text(str(right.get("text") or "")),
+            ]
+        )
+
+    def _renumber_chunks(self, chunks: Sequence[ChunkDict]) -> List[ChunkDict]:
+        renumbered: List[ChunkDict] = []
+        for index, chunk in enumerate(chunks, start=1):
+            next_chunk = dict(chunk)
+            source_file = str(next_chunk.get("source_file") or next_chunk.get("file_name") or "")
+            next_chunk["chunk_id"] = f"{source_file}::chunk_{index:04d}"
+            renumbered.append(next_chunk)
+        return renumbered
+
+    @staticmethod
+    def _section_title(heading: str | None, section_path: Sequence[str]) -> str | None:
+        title = normalize_narrative_text(heading or "")
+        if not title and section_path:
+            title = normalize_narrative_text(str(section_path[-1]))
+        return title.rstrip(":") or None
+
+    @staticmethod
+    def _first_or_none(values: Sequence[int]) -> int | None:
+        return values[0] if values else None
+
     @staticmethod
     def _extract_table_header_line(text: str) -> str | None:
         lines = [line.strip() for line in _clean_text(text).splitlines() if line.strip()]
@@ -766,13 +947,7 @@ def chunk_consolidated_blocks(
 
 
 def _clean_text(value: Any) -> str:
-    if value is None:
-        return ""
-
-    text = str(value).replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    return clean_text(value)
 
 
 def _coerce_int(value: Any) -> int | None:
